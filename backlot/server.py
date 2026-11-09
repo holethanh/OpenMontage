@@ -2,7 +2,9 @@
 
 The watcher observes ``projects/`` with watchfiles; on any change it bumps a
 per-project version and wakes SSE subscribers, who tell the browser to
-refetch state. The server never writes to project directories.
+refetch state. The board/library routes never write to project directories. The only write
+routes are the affiliate toolkit (``/api/affiliate/*``), which are limited to
+local origins and create projects via ``lib.checkpoint.init_project``.
 """
 
 from __future__ import annotations
@@ -15,10 +17,14 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+from urllib.parse import urlparse
 
+from backlot import affiliate
 from backlot.state import (
     PROJECTS_DIR,
     REPO_ROOT,
@@ -36,6 +42,40 @@ THUMB_WIDTHS = (320, 640, 960)
 _IGNORE_PARTS = {"node_modules", ".git", "__pycache__", ".cache"}
 
 SSE_HEARTBEAT_SECONDS = 15
+
+
+_LOCAL_HOSTS = {"127.0.0.1", "localhost"}
+
+
+class HooksRequest(BaseModel):
+    template: str
+    language: str = "vi"
+    count: int = Field(default=6, ge=1, le=24)
+
+
+class CopyRequest(BaseModel):
+    platform: str = "tiktok"
+    language: str = "vi"
+    hook: str = Field(min_length=1, max_length=500)
+    cta: str = Field(default="", max_length=500)
+
+
+class ComplianceRequest(BaseModel):
+    text: str = Field(max_length=20000)
+    platform: str = "tiktok"
+    language: str = "vi"
+    network: str = "other"
+    has_affiliate_link: bool = True
+
+
+class BatchRequest(BaseModel):
+    product_id: str
+    templates: list[str] = Field(min_length=1, max_length=10)
+    language: str = "vi"
+    platform: str = "tiktok"
+    hooks_per_template: int = Field(default=1, ge=1, le=5)
+    aspect_ratios: Optional[list[str]] = None
+    series: Optional[str] = Field(default=None, max_length=80)
 
 
 def _ui_html(name: str, assets: tuple[str, ...]) -> HTMLResponse:
@@ -284,6 +324,95 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="media not found")
         return FileResponse(target)
 
+    # ---- Affiliate toolkit -------------------------------------------
+
+    @app.exception_handler(affiliate.AffiliateError)
+    async def affiliate_error(request: Request, exc: affiliate.AffiliateError) -> JSONResponse:
+        status = 404 if isinstance(exc, affiliate.NotFoundError) else 400
+        return JSONResponse({"detail": str(exc)}, status_code=status)
+
+    @app.middleware("http")
+    async def local_origin_only_for_writes(request, call_next):
+        # Host checking stops DNS rebinding; this stops other websites from
+        # making the browser POST to localhost (CSRF).
+        if request.method in ("POST", "PUT", "PATCH", "DELETE"):
+            origin = request.headers.get("origin")
+            if origin and urlparse(origin).hostname not in _LOCAL_HOSTS:
+                return JSONResponse({"detail": "cross-origin write blocked"}, status_code=403)
+        return await call_next(request)
+
+    @app.get("/api/affiliate/meta")
+    async def aff_meta() -> dict:
+        return {
+            "templates": affiliate.list_templates(),
+            "platforms": sorted(affiliate.PLATFORMS),
+            "languages": list(affiliate.LANGUAGES),
+            "networks": list(affiliate.NETWORKS),
+            "max_batch": affiliate.MAX_BATCH,
+        }
+
+    @app.get("/api/affiliate/products")
+    async def aff_products() -> list:
+        return await asyncio.to_thread(affiliate.list_products)
+
+    @app.post("/api/affiliate/products")
+    async def aff_product_create(payload: affiliate.ProductIn) -> dict:
+        return await asyncio.to_thread(affiliate.save_product, payload)
+
+    @app.put("/api/affiliate/products/{product_id}")
+    async def aff_product_update(product_id: str, payload: affiliate.ProductIn) -> dict:
+        return await asyncio.to_thread(affiliate.save_product, payload, product_id)
+
+    @app.delete("/api/affiliate/products/{product_id}")
+    async def aff_product_delete(product_id: str) -> dict:
+        await asyncio.to_thread(affiliate.delete_product, product_id)
+        return {"ok": True}
+
+    @app.post("/api/affiliate/products/{product_id}/hooks")
+    async def aff_hooks(product_id: str, payload: HooksRequest) -> dict:
+        product = affiliate.get_product(product_id)
+        return affiliate.generate_hooks(product, payload.template, payload.language, payload.count)
+
+    @app.post("/api/affiliate/products/{product_id}/copy")
+    async def aff_copy(product_id: str, payload: CopyRequest) -> dict:
+        product = affiliate.get_product(product_id)
+        copy = affiliate.build_copy(product, payload.platform, payload.language, payload.hook, payload.cta)
+        copy["compliance"] = affiliate.check_compliance(
+            copy["caption"], payload.platform, bool(product.get("affiliate_url")),
+            product.get("network", "other"), payload.language)
+        return copy
+
+    @app.post("/api/affiliate/compliance")
+    async def aff_compliance(payload: ComplianceRequest) -> dict:
+        return affiliate.check_compliance(
+            payload.text, payload.platform, payload.has_affiliate_link,
+            payload.network, payload.language)
+
+    @app.post("/api/affiliate/batch")
+    async def aff_batch(payload: BatchRequest) -> dict:
+        return await asyncio.to_thread(
+            lambda: affiliate.create_batch(
+                payload.product_id, payload.templates, language=payload.language,
+                platform=payload.platform, hooks_per_template=payload.hooks_per_template,
+                aspect_ratios=payload.aspect_ratios, series=payload.series))
+
+    @app.get("/api/affiliate/results")
+    async def aff_results() -> dict:
+        return await asyncio.to_thread(affiliate.results_summary)
+
+    @app.post("/api/affiliate/results")
+    async def aff_result_add(payload: affiliate.ResultIn) -> dict:
+        return await asyncio.to_thread(affiliate.add_result, payload)
+
+    @app.delete("/api/affiliate/results/{result_id}")
+    async def aff_result_delete(result_id: str) -> dict:
+        await asyncio.to_thread(affiliate.delete_result, result_id)
+        return {"ok": True}
+
+    @app.get("/affiliate")
+    async def affiliate_page() -> HTMLResponse:
+        return _ui_html("affiliate.html", ("board.css", "affiliate.css", "affiliate.js"))
+
     # ---- UI ------------------------------------------------------------
 
     @app.get("/p/{project_id}")
@@ -309,7 +438,7 @@ def create_app() -> FastAPI:
     async def ui_no_cache(request, call_next):
         response = await call_next(request)
         path = request.url.path
-        if path == "/" or path.startswith("/ui") or path.startswith("/p/"):
+        if path in ("/", "/affiliate") or path.startswith("/ui") or path.startswith("/p/"):
             response.headers["Cache-Control"] = "no-cache"
         return response
 

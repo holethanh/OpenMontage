@@ -62,3 +62,22 @@ Projects without `series` (including older projects with no `project.json`)
 show as loose cards, exactly as before.
 
 Design doc: `internal/design/LIVING_STORYBOARD.md`.
+
+## Affiliate toolkit
+
+A local workspace for affiliate-marketing videos at `/affiliate` (linked from the library).
+It is the only part of Backlot that writes: it keeps a product list in
+`.backlot/affiliate/store.json` (override with `OPENMONTAGE_AFFILIATE_DIR`) and creates
+projects through `lib.checkpoint.init_project`. Write routes reject non-local `Origin`s.
+
+| Tab | What it does |
+|---|---|
+| Sản phẩm | Product hub: name, affiliate link, price, network, commission %, selling points |
+| Tạo video | 5 templates (review, top-N, unboxing/demo, comparison, vertical UGC), hook + CTA generator (vi/en), per-platform caption + hashtags + disclosure, **batch** project creation (max 30 variants) |
+| Tuân thủ | Disclosure check, risky-claim scan (guarantees, health/income claims, fake urgency), pre-post checklist |
+| Kết quả | Log views/clicks/orders/commission/cost per video; CTR, CVR, EPC, profit, ROI by video, template and hook angle |
+
+Each created project gets `artifacts/affiliate_brief.json`; the agent follows
+`skills/creative/affiliate-marketing.md`. Compliance checks are heuristics, not legal advice.
+Caption/hook generation is rule-based (offline, no API key needed).
+Tests: `python -m pytest tests/backlot/test_affiliate.py`.
