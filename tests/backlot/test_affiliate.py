@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import io
 import json
 
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from backlot import affiliate as aff
 from backlot import server as server_mod
@@ -38,11 +40,16 @@ PRODUCT = {
     "affiliate_url": "https://example.com/aff?id=1",
     "price": 499000,
     "currency": "VND",
-    "selling_points": ["Nhỏ gọn", "Sạc USB-C"],
+    "description": "Nhỏ gọn, sạc USB-C. Pin dùng được 10 lần xay.",
     "network": "shopee",
     "commission_pct": 10,
-    "category": "Gia dụng",
 }
+
+
+def _png(size=(8, 8), fmt="PNG") -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", size, (200, 30, 30)).save(buf, fmt)
+    return buf.getvalue()
 
 
 def _product(client, **over):
@@ -232,6 +239,105 @@ def test_results_validation(client):
     assert client.post("/api/affiliate/results", json={"project_id": "a", "day": "31/12"}).status_code == 422
     empty = client.get("/api/affiliate/results").json()
     assert empty["totals"]["ctr"] is None and empty["projects"] == []
+
+
+# ---- description / image upload ---------------------------------------------
+
+def test_description_replaces_old_fields(client):
+    p = _product(client)
+    assert p["description"].startswith("Nhỏ gọn")
+    assert "selling_points" not in p and "category" not in p and "image_url" not in p
+    assert p["image_file"] == ""
+
+
+def test_hooks_use_description_phrases():
+    pts = aff.description_points("Nhỏ gọn, sạc USB-C. Pin dùng được 10 lần xay!")
+    assert pts == ["Nhỏ gọn", "sạc USB-C", "Pin dùng được 10 lần xay"]
+    out = aff.generate_hooks({"name": "X", "description": "Pin trâu. Nhẹ"}, "top_n", "vi", 8)
+    assert any("pin trâu" in h["text"] for h in out["hooks"] if h["angle"] in ("benefit", "problem"))
+    assert aff.description_points("") == [] and aff.description_points("x" * 200) == []
+
+
+def test_legacy_selling_points_still_feed_description():
+    legacy = {"name": "Old", "selling_points": ["Bền", "Rẻ"]}
+    assert aff.product_description(legacy) == "Bền. Rẻ"
+    assert aff.generate_hooks(legacy, "review", "vi", 3)["hooks"]
+
+
+def test_image_upload_serve_replace_delete(client, env):
+    p = _product(client)
+    url = f"/api/affiliate/products/{p['id']}/image"
+    assert client.get(url).status_code == 404
+    r = client.put(url, content=_png(), headers={"Content-Type": "image/png"})
+    assert r.status_code == 200 and r.json()["image_file"].endswith(".png")
+    first = r.json()["image_file"]
+    got = client.get(url)
+    assert got.status_code == 200 and got.content == _png()
+    # replacing removes the old file
+    r2 = client.put(url, content=_png(fmt="JPEG"))
+    assert r2.json()["image_file"].endswith(".jpg")
+    assert not (aff.AFFILIATE_DIR / "images" / first).exists()
+    # editing the product keeps the image
+    kept = client.put(f"/api/affiliate/products/{p['id']}", json={**PRODUCT, "price": 5}).json()
+    assert kept["image_file"] == r2.json()["image_file"]
+    assert client.delete(url).json()["image_file"] == ""
+    assert client.get(url).status_code == 404
+    assert list((aff.AFFILIATE_DIR / "images").iterdir()) == []
+
+
+@pytest.mark.parametrize("body", [b"", b"not an image", b"<svg xmlns='http://www.w3.org/2000/svg'/>", b"GIF89a" + b"\x00" * 4])
+def test_image_upload_rejects_bad_files(client, body):
+    p = _product(client)
+    r = client.put(f"/api/affiliate/products/{p['id']}/image", content=body)
+    assert r.status_code == 400
+    assert not (aff.AFFILIATE_DIR / "images").exists() or not list((aff.AFFILIATE_DIR / "images").iterdir())
+
+
+def test_image_upload_size_limit_and_unknown_product(client, monkeypatch):
+    p = _product(client)
+    monkeypatch.setattr(aff, "MAX_IMAGE_BYTES", 100)
+    r = client.put(f"/api/affiliate/products/{p['id']}/image", content=_png((64, 64)))
+    assert r.status_code == 400 and "quá lớn" in r.json()["detail"]
+    monkeypatch.setattr(aff, "MAX_IMAGE_BYTES", 8 * 1024 * 1024)
+    assert client.put("/api/affiliate/products/nope/image", content=_png()).status_code == 404
+    assert client.get("/api/affiliate/products/nope/image").status_code == 404
+
+
+def test_image_path_traversal_is_contained(env):
+    assert aff._image_path("../store.json") is None
+    assert aff._image_path("a/b.png") is None
+    assert aff._image_path("") is None
+
+
+def test_image_upload_cross_origin_blocked(client):
+    p = _product(client)
+    r = client.put(f"/api/affiliate/products/{p['id']}/image", content=_png(), headers={"Origin": "https://evil.example"})
+    assert r.status_code == 403
+
+
+def test_deleting_product_removes_its_image(client):
+    p = _product(client)
+    client.put(f"/api/affiliate/products/{p['id']}/image", content=_png())
+    assert len(list((aff.AFFILIATE_DIR / "images").iterdir())) == 1
+    client.delete(f"/api/affiliate/products/{p['id']}")
+    assert list((aff.AFFILIATE_DIR / "images").iterdir()) == []
+
+
+def test_batch_copies_image_into_project(client, env):
+    p = _product(client)
+    client.put(f"/api/affiliate/products/{p['id']}/image", content=_png())
+    body = client.post("/api/affiliate/batch", json={"product_id": p["id"], "templates": ["review"]}).json()
+    pid = body["projects"][0]["project_id"]
+    assert (env / pid / "assets" / "images" / "product.png").read_bytes() == _png()
+    brief = json.loads((env / pid / "artifacts" / "affiliate_brief.json").read_text(encoding="utf-8"))
+    assert brief["product"]["image_path"] == "assets/images/product.png"
+    assert brief["product"]["description"].startswith("Nhỏ gọn")
+    assert "assets/images/product.png" in brief["agent_instructions"]
+    # no image -> no image path, nothing copied
+    q = _product(client, name="Không ảnh")
+    pid2 = client.post("/api/affiliate/batch", json={"product_id": q["id"], "templates": ["review"]}).json()["projects"][0]["project_id"]
+    brief2 = json.loads((env / pid2 / "artifacts" / "affiliate_brief.json").read_text(encoding="utf-8"))
+    assert brief2["product"]["image_path"] == "" and "product photo" not in brief2["agent_instructions"]
 
 
 # ---- security / pages ------------------------------------------------------

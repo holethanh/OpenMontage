@@ -368,6 +368,26 @@ def create_app() -> FastAPI:
         await asyncio.to_thread(affiliate.delete_product, product_id)
         return {"ok": True}
 
+    @app.put("/api/affiliate/products/{product_id}/image")
+    async def aff_image_upload(product_id: str, request: Request) -> dict:
+        # Raw image bytes in the body (no multipart dependency). Reject early
+        # on the declared size, then re-check after reading.
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > affiliate.MAX_IMAGE_BYTES:
+            raise affiliate.AffiliateError(
+                f"Ảnh quá lớn (tối đa {affiliate.MAX_IMAGE_BYTES // (1024 * 1024)} MB)")
+        data = await request.body()
+        return await asyncio.to_thread(affiliate.save_product_image, product_id, data)
+
+    @app.delete("/api/affiliate/products/{product_id}/image")
+    async def aff_image_delete(product_id: str) -> dict:
+        return await asyncio.to_thread(affiliate.delete_product_image, product_id)
+
+    @app.get("/api/affiliate/products/{product_id}/image")
+    async def aff_image_get(product_id: str) -> FileResponse:
+        path = await asyncio.to_thread(affiliate.product_image_path, product_id)
+        return FileResponse(path, headers={"X-Content-Type-Options": "nosniff"})
+
     @app.post("/api/affiliate/products/{product_id}/hooks")
     async def aff_hooks(product_id: str, payload: HooksRequest) -> dict:
         product = affiliate.get_product(product_id)

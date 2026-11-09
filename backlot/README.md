@@ -72,7 +72,7 @@ projects through `lib.checkpoint.init_project`. Write routes reject non-local `O
 
 | Tab | What it does |
 |---|---|
-| Sản phẩm | Product hub: name, affiliate link, price, network, commission %, selling points |
+| Sản phẩm | Product hub: name, affiliate link, price, network, commission %, free-text description, product photo uploaded from your computer |
 | Tạo video | 5 templates (review, top-N, unboxing/demo, comparison, vertical UGC), hook + CTA generator (vi/en), per-platform caption + hashtags + disclosure, **batch** project creation (max 30 variants) |
 | Tuân thủ | Disclosure check, risky-claim scan (guarantees, health/income claims, fake urgency), pre-post checklist |
 | Kết quả | Log views/clicks/orders/commission/cost per video; CTR, CVR, EPC, profit, ROI by video, template and hook angle |

@@ -11,9 +11,11 @@ through ``lib.checkpoint.init_project`` so they appear in the normal library.
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
+import shutil
 import threading
 import unicodedata
 import uuid
@@ -21,6 +23,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from PIL import Image
 from pydantic import BaseModel, Field, field_validator
 
 from backlot import state as state_mod
@@ -47,21 +50,14 @@ class NotFoundError(AffiliateError):
 # Models
 # ---------------------------------------------------------------------------
 
-def _clean_list(values: list[str]) -> list[str]:
-    return [v.strip() for v in values if isinstance(v, str) and v.strip()][:12]
-
-
 class ProductIn(BaseModel):
     name: str = Field(min_length=1, max_length=120)
     affiliate_url: str = Field(default="", max_length=2000)
     price: Optional[float] = Field(default=None, ge=0)
     currency: str = Field(default="VND", max_length=8)
-    image_url: str = Field(default="", max_length=2000)
-    selling_points: list[str] = Field(default_factory=list)
+    description: str = Field(default="", max_length=3000)
     network: str = "other"
     commission_pct: Optional[float] = Field(default=None, ge=0, le=100)
-    category: str = Field(default="", max_length=60)
-    notes: str = Field(default="", max_length=2000)
 
     @field_validator("name")
     @classmethod
@@ -71,7 +67,7 @@ class ProductIn(BaseModel):
             raise ValueError("name must not be blank")
         return v
 
-    @field_validator("affiliate_url", "image_url")
+    @field_validator("affiliate_url")
     @classmethod
     def _http_only(cls, v: str) -> str:
         v = v.strip()
@@ -85,10 +81,10 @@ class ProductIn(BaseModel):
         v = v.strip().lower()
         return v if v in NETWORKS else "other"
 
-    @field_validator("selling_points")
+    @field_validator("description")
     @classmethod
-    def _points(cls, v: list[str]) -> list[str]:
-        return _clean_list(v)
+    def _description(cls, v: str) -> str:
+        return v.strip()
 
 
 class ResultIn(BaseModel):
@@ -176,14 +172,17 @@ def save_product(payload: ProductIn, product_id: Optional[str] = None) -> dict:
             if existing is None:
                 raise NotFoundError(f"unknown product: {product_id}")
             created = existing.get("created_at", now)
+            image_file = existing.get("image_file", "")
         else:
             base = slugify(payload.name, "product")
             product_id, n = base, 2
             while product_id in store["products"]:
                 product_id, n = f"{base}-{n}", n + 1
             created = now
+            image_file = ""
         record = {
             **payload.model_dump(),
+            "image_file": image_file,
             "id": product_id,
             "created_at": created,
             "updated_at": now,
@@ -196,9 +195,90 @@ def save_product(payload: ProductIn, product_id: Optional[str] = None) -> dict:
 def delete_product(product_id: str) -> None:
     with _LOCK:
         store = _load_store()
-        if store["products"].pop(product_id, None) is None:
+        removed = store["products"].pop(product_id, None)
+        if removed is None:
             raise NotFoundError(f"unknown product: {product_id}")
         _save_store(store)
+        _remove_image_file(removed.get("image_file", ""))
+
+
+# ---------------------------------------------------------------------------
+# Product image upload (raw request body; validated + stored locally)
+# ---------------------------------------------------------------------------
+
+MAX_IMAGE_BYTES = 8 * 1024 * 1024
+_IMAGE_EXT = {"PNG": ".png", "JPEG": ".jpg", "WEBP": ".webp", "GIF": ".gif"}
+
+
+def _images_dir() -> Path:
+    return AFFILIATE_DIR / "images"
+
+
+def _image_path(name: str) -> Optional[Path]:
+    """Resolve a stored image filename; never escapes the images directory."""
+    if not name or name != Path(name).name:
+        return None
+    path = _images_dir() / name
+    return path if path.is_file() else None
+
+
+def _remove_image_file(name: str) -> None:
+    path = _image_path(name)
+    if path is not None:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def save_product_image(product_id: str, data: bytes) -> dict:
+    if not data:
+        raise AffiliateError("file ảnh trống")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise AffiliateError(f"Ảnh quá lớn (tối đa {MAX_IMAGE_BYTES // (1024 * 1024)} MB)")
+    try:
+        with Image.open(io.BytesIO(data)) as img:
+            fmt = img.format
+            img.verify()
+    except Exception as exc:
+        raise AffiliateError("File không phải ảnh hợp lệ (hỗ trợ PNG, JPG, WEBP, GIF)") from exc
+    if fmt not in _IMAGE_EXT:
+        raise AffiliateError("Định dạng ảnh không hỗ trợ (dùng PNG, JPG, WEBP hoặc GIF)")
+    with _LOCK:
+        store = _load_store()
+        record = store["products"].get(product_id)
+        if record is None:
+            raise NotFoundError(f"unknown product: {product_id}")
+        _images_dir().mkdir(parents=True, exist_ok=True)
+        name = f"{product_id}-{uuid.uuid4().hex[:8]}{_IMAGE_EXT[fmt]}"
+        (_images_dir() / name).write_bytes(data)
+        old = record.get("image_file", "")
+        record["image_file"] = name
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_store(store)
+        _remove_image_file(old)
+    return record
+
+
+def delete_product_image(product_id: str) -> dict:
+    with _LOCK:
+        store = _load_store()
+        record = store["products"].get(product_id)
+        if record is None:
+            raise NotFoundError(f"unknown product: {product_id}")
+        old = record.get("image_file", "")
+        record["image_file"] = ""
+        record["updated_at"] = datetime.now(timezone.utc).isoformat()
+        _save_store(store)
+        _remove_image_file(old)
+    return record
+
+
+def product_image_path(product_id: str) -> Path:
+    path = _image_path(get_product(product_id).get("image_file", ""))
+    if path is None:
+        raise NotFoundError("sản phẩm chưa có ảnh")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -347,6 +427,26 @@ _ANGLE_NEEDS_PRICE = {"price"}
 _FALLBACK_POINT = {"vi": "kết quả tốt hơn", "en": "better results"}
 
 
+def product_description(product: dict) -> str:
+    """Description text; older records only had ``selling_points``."""
+    text = (product.get("description") or "").strip()
+    if not text and product.get("selling_points"):
+        text = ". ".join(str(x) for x in product["selling_points"])
+    return text
+
+
+def description_points(description: str, limit: int = 6) -> list[str]:
+    """Short phrases from a free-text description, used as hook material."""
+    seen: set[str] = set()
+    points: list[str] = []
+    for part in re.split(r"[\n\r.;!?,•·]+|\s[-–—]\s", description or ""):
+        part = part.strip(" -–—*:\t")
+        if 3 <= len(part) <= 70 and part.lower() not in seen:
+            seen.add(part.lower())
+            points.append(part)
+    return points[:limit]
+
+
 def format_price(price: Optional[float], currency: str) -> str:
     if price is None:
         return ""
@@ -359,7 +459,7 @@ def generate_hooks(product: dict, template_id: str, language: str = "vi", count:
         raise AffiliateError(f"language must be one of {LANGUAGES}")
     tpl = _template(template_id)
     count = max(1, min(int(count), 24))
-    points = product.get("selling_points") or []
+    points = description_points(product_description(product))
     price = format_price(product.get("price"), product.get("currency", ""))
 
     preferred = list(tpl["hook_angles"])
@@ -420,8 +520,6 @@ AMAZON_STATEMENT = "As an Amazon Associate I earn from qualifying purchases."
 def make_hashtags(product: dict, platform: str) -> list[str]:
     spec = PLATFORMS[platform]
     candidates: list[str] = []
-    if product.get("category"):
-        candidates.append(slugify(product["category"]).replace("-", ""))
     candidates.append(slugify(product["name"]).replace("-", "")[:30])
     candidates += ["affiliate"] + spec["tags"]
     tags: list[str] = []
@@ -562,15 +660,17 @@ def _unique_project_id(base: str, reserved: set[str]) -> str:
     return candidate
 
 
-def _agent_instructions(tpl: dict, hook: str, cta: str, aspect: str, language: str) -> str:
+def _agent_instructions(tpl: dict, hook: str, cta: str, aspect: str, language: str, image_path: str = "") -> str:
     footage = (" The user must supply real footage of the product before the assets stage."
                if tpl["needs_footage"] else "")
+    image = (f" Use the product photo at {image_path} (user-supplied) as the product reference."
+             if image_path else "")
     return (
         "Read AGENT_GUIDE.md first, then skills/creative/affiliate-marketing.md. "
         f"Run the '{tpl['pipeline']}' pipeline with style '{tpl['style']}', aspect {aspect}, "
         f"~{tpl['duration_seconds']}s, language '{language}'. Open with this exact hook: \"{hook}\". "
         f"Close with this CTA: \"{cta}\". Show the disclosure text on screen. "
-        "Do not add claims that are not in selling_points." + footage
+        "Do not add claims that are not in the product description." + footage + image
     )
 
 
@@ -623,12 +723,18 @@ def create_batch(
             project_id, title=title, pipeline_type=tpl["pipeline"],
             pipeline_dir=state_mod.PROJECTS_DIR, style_playbook=tpl["style"], series=series,
         )
+        image_path = ""
+        source_image = _image_path(product.get("image_file", ""))
+        if source_image is not None:
+            (project_dir / "assets" / "images").mkdir(parents=True, exist_ok=True)
+            image_path = f"assets/images/product{source_image.suffix}"
+            shutil.copy2(source_image, project_dir / image_path)
         brief = {
             "version": "1.0",
             "kind": "affiliate_brief",
             "product": {k: product.get(k) for k in (
-                "id", "name", "affiliate_url", "price", "currency", "image_url",
-                "selling_points", "network", "commission_pct", "category")},
+                "id", "name", "affiliate_url", "price", "currency",
+                "network", "commission_pct")},
             "template": tid,
             "pipeline": tpl["pipeline"],
             "style": tpl["style"],
@@ -642,8 +748,10 @@ def create_batch(
             "cta": cta,
             "copy": copy,
             "compliance": compliance,
-            "agent_instructions": _agent_instructions(tpl, hook["text"], cta, aspect, language),
+            "agent_instructions": _agent_instructions(tpl, hook["text"], cta, aspect, language, image_path),
         }
+        brief["product"]["description"] = product_description(product)
+        brief["product"]["image_path"] = image_path
         (project_dir / "artifacts" / "affiliate_brief.json").write_text(
             json.dumps(brief, indent=2, ensure_ascii=False), encoding="utf-8")
         marker_path = project_dir / "project.json"

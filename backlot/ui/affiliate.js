@@ -57,26 +57,47 @@ function productForm() {
     url: el("input", { type: "url", placeholder: "https://…", value: v("affiliate_url") }),
     price: el("input", { type: "number", min: 0, step: "any", value: v("price") }),
     currency: el("input", { maxlength: 8, value: v("currency", "VND") }),
-    image: el("input", { type: "url", placeholder: "https://…", value: v("image_url") }),
+    image: el("input", { type: "file", accept: "image/png,image/jpeg,image/webp,image/gif" }),
     network: el("select", {}, ...S.meta.networks.map((n) => el("option", { value: n }, n))),
     commission: el("input", { type: "number", min: 0, max: 100, step: "any", value: v("commission_pct") }),
-    category: el("input", { maxlength: 60, value: v("category") }),
-    points: el("textarea", { placeholder: "Mỗi dòng một điểm bán hàng" }),
+    description: el("textarea", { maxlength: 3000, placeholder: "Mô tả sản phẩm: tính năng, chất liệu, đối tượng phù hợp… (AI chỉ được nêu những điều có trong mô tả này)" }),
   };
   f.network.value = v("network", "other");
-  f.points.value = (p ? p.selling_points : []).join("\n");
+  f.description.value = p ? (p.description || (p.selling_points || []).join(". ")) : "";
+  let pendingImage = null;
+  const preview = el("div", { class: "aff-muted" });
+  const showPreview = () => {
+    preview.innerHTML = "";
+    const src = pendingImage ? URL.createObjectURL(pendingImage)
+      : (p && p.image_file ? `/api/affiliate/products/${p.id}/image?v=${encodeURIComponent(p.image_file)}` : null);
+    if (src) preview.append(el("img", { class: "aff-thumb", src, alt: "Ảnh sản phẩm" }));
+    else preview.append("Chưa có ảnh");
+  };
+  f.image.addEventListener("change", () => {
+    const file = f.image.files[0];
+    if (file && file.size > 8 * 1024 * 1024) { f.image.value = ""; toast("Ảnh quá lớn (tối đa 8 MB)", true); return; }
+    pendingImage = file || null; showPreview();
+  });
+  showPreview();
   const body = () => ({
     name: f.name.value, affiliate_url: f.url.value,
     price: f.price.value === "" ? null : Number(f.price.value),
-    currency: f.currency.value || "VND", image_url: f.image.value, network: f.network.value,
+    currency: f.currency.value || "VND", network: f.network.value,
     commission_pct: f.commission.value === "" ? null : Number(f.commission.value),
-    category: f.category.value,
-    selling_points: f.points.value.split("\n").map((s) => s.trim()).filter(Boolean),
+    description: f.description.value,
   });
   const form = el("form", { class: "aff-form", onsubmit: guard(async (e) => {
     e.preventDefault();
     const saved = p ? await send("PUT", `/api/affiliate/products/${p.id}`, body())
       : await send("POST", "/api/affiliate/products", body());
+    if (pendingImage) {
+      const up = await fetch(`/api/affiliate/products/${saved.id}/image`, { method: "PUT", headers: { "Content-Type": pendingImage.type || "application/octet-stream" }, body: pendingImage });
+      if (!up.ok) {
+        const d = await up.json().catch(() => ({}));
+        S.selected = saved.id; S.editing = saved.id; await load(); render();
+        throw new Error(`Đã lưu sản phẩm nhưng tải ảnh lỗi: ${d.detail || up.statusText}`);
+      }
+    }
     S.selected = saved.id; S.editing = null;
     toast("Đã lưu sản phẩm");
     await load(); render();
@@ -84,8 +105,12 @@ function productForm() {
     field("Tên sản phẩm *", f.name), field("Link affiliate", f.url),
     el("div", { class: "aff-row" }, field("Giá", f.price), field("Tiền tệ", f.currency)),
     el("div", { class: "aff-row" }, field("Nền tảng affiliate", f.network), field("Hoa hồng (%)", f.commission)),
-    field("Danh mục", f.category), field("Ảnh sản phẩm (URL)", f.image),
-    field("Điểm bán hàng", f.points),
+    field("Mô tả sản phẩm", f.description),
+    field("Ảnh sản phẩm (tải từ máy, PNG/JPG/WEBP/GIF, tối đa 8 MB)", f.image), preview,
+    p && p.image_file ? el("button", { class: "aff-btn danger", type: "button", onclick: guard(async () => {
+      await send("DELETE", `/api/affiliate/products/${p.id}/image`);
+      await load(); render();
+    }) }, "Xóa ảnh") : null,
     el("div", { class: "aff-row" },
       el("button", { class: "aff-btn", type: "submit" }, p ? "Cập nhật" : "Thêm sản phẩm"),
       p ? el("button", { class: "aff-btn ghost", type: "button", onclick: () => { S.editing = null; render(); } }, "Hủy") : null),
@@ -103,8 +128,9 @@ function productList() {
       el("div", { class: "aff-meta" },
         el("span", { class: "chip" }, p.network), price ? el("span", { class: "chip" }, price) : null,
         p.commission_pct != null ? el("span", { class: "chip" }, `${p.commission_pct}% hoa hồng`) : null,
-        p.category ? el("span", { class: "chip" }, p.category) : null),
-      p.selling_points.length ? el("p", { class: "aff-muted" }, p.selling_points.join(" · ")) : null,
+        ),
+      p.image_file ? el("img", { class: "aff-thumb", src: `/api/affiliate/products/${p.id}/image?v=${encodeURIComponent(p.image_file)}`, alt: p.name }) : null,
+      (p.description || (p.selling_points || []).join(". ")) ? el("p", { class: "aff-muted aff-desc" }, p.description || p.selling_points.join(". ")) : null,
       el("div", { class: "aff-row" },
         el("button", { class: "aff-btn", onclick: () => { S.selected = p.id; S.tab = "create"; render(); } }, "Tạo video"),
         el("button", { class: "aff-btn ghost", onclick: () => { S.editing = p.id; render(); } }, "Sửa"),
